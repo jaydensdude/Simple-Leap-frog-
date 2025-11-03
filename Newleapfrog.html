@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LeapFrog — Browser Game</title>
+<style>
+    :root{
+        --bg:#0b2b3b;
+        --water:#0a6ca8;
+        --ui:#f3f7f9;
+        --accent:#ffd166;
+    }
+    html,body{height:100%;margin:0;background:linear-gradient(#081018,var(--bg));font-family:Inter,system-ui,Segoe UI,Roboto,Arial;}
+    canvas{display:block;width:100%;height:100vh;background:transparent}
+    #ui {
+        position: absolute; left: 12px; top: 12px; color:var(--ui); z-index:10;
+        user-select:none;
+    }
+    #controls{position:absolute; right:12px; top:12px; color:var(--ui); z-index:10; text-align:right}
+    .btn{background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.06); padding:8px 10px; margin-left:6px; border-radius:6px; color:var(--ui); cursor:pointer;}
+    #hud{padding:8px 12px; background:linear-gradient(135deg,rgba(255,255,255,0.03),rgba(255,255,255,0.01)); border-radius:10px; display:inline-block}
+    #message{position: absolute; left:50%; top:50%; transform:translate(-50%,-50%); color:var(--ui); z-index:20; text-align:center; font-size:18px; background:rgba(0,0,0,0.4); padding:18px 22px; border-radius:12px; display:none}
+    #touchControls{position:absolute; left:50%; bottom:18px; transform:translateX(-50%); z-index:12; display:flex; gap:12px}
+    .tcircle{width:72px;height:72px;border-radius:50%;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;color:var(--ui);font-weight:600;user-select:none}
+    @media (max-width:700px){.tcircle{width:56px;height:56px}}
+    a.small{color:var(--accent);text-decoration:none;font-size:12px;margin-left:8px}
+    footer{position: absolute; left:12px; bottom:12px; color:rgba(255,255,255,0.5); font-size:12px}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+    <div id="hud">
+        Score: <span id="score">0</span> &nbsp;|&nbsp; Lives: <span id="lives">3</span> &nbsp;|&nbsp; Level: <span id="level">1</span>
+    </div>
+</div>
+<div id="controls">
+    <button id="pause" class="btn">Pause</button>
+    <button id="restart" class="btn">Restart</button>
+</div>
+<div id="message"></div>
+<div id="touchControls" style="display:none">
+    <div id="jumpBtn" class="tcircle">Jump</div>
+    <div id="chargeBtn" class="tcircle">Hold</div>
+</div>
+<footer>LeapFrog — use arrow keys or tap to jump. <a class="small" href="#" id="credits">Info</a></footer>
+
+<script>
+/*
+    LeapFrog - single-file browser game
+    Features:
+    - Canvas-based physics jump mechanic (charge and release)
+    - Procedural lily pads, moving logs, predators
+    - Levels, score, lives, high score (localStorage)
+    - Keyboard and touch controls, simple particle effects
+    - Pause, restart, visual polish
+*/
+
+// Utilities
+const rand = (a,b)=>Math.random()*(b-a)+a;
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const TAU=Math.PI*2;
+
+// Canvas init
+const canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
+let W=canvas.width=innerWidth, H=canvas.height=innerHeight;
+addEventListener('resize',()=>{W=canvas.width=innerWidth; H=canvas.height=innerHeight;});
+let last=0, running=true;
+
+// Game state
+let state = {
+    score:0, lives:3, level:1, player:null, pads:[], obstacles:[], particles:[], high:0, paused:false, spawnTimer:0
+};
+state.high = Number(localStorage.getItem('leapfrog_high')||0);
+
+// Player class
+class Frog {
+    constructor(x,y){
+        this.x=x; this.y=y;
+        this.vx=0; this.vy=0;
+        this.radius=18;
+        this.onPad=null;
+        this.charge=0; this.maxCharge=1.25;
+        this.canJump=true; this.inv=0;
+    }
+    update(dt){
+        // charge handling (if holding)
+        if(this.holding){
+            this.charge = clamp(this.charge + dt*0.9, 0, this.maxCharge);
+        }
+        // physics
+        this.vy += 1400 * dt; // gravity
+        this.x += this.vx * dt;
+        this.y += this.vy * dt;
+        // world bounds
+        if(this.x < -50) this.x = -50, this.vx = Math.abs(this.vx)*0.2;
+        if(this.x > W+50) this.x = W+50, this.vx = -Math.abs(this.vx)*0.2;
+        // landing on pads
+        this.onPad = null;
+        for(let p of state.pads){
+            if(!p) continue;
+            if(this.y + this.radius > p.y-6 && this.y + this.radius < p.y + p.h && Math.abs(this.x - p.x) < p.w/2 - 6 && this.vy >= -80){
+                // Land
+                this.y = p.y - this.radius;
+                this.vy = 0;
+                this.onPad = p;
+                this.canJump = true;
+                if(p.move) this.x += p.vx * dt; // ride moving pad
+                break;
+            }
+        }
+        // water death
+        if(this.y > H + 100){
+            loseLife();
+        }
+        // invulnerability timer
+        if(this.inv > 0) this.inv = Math.max(0, this.inv - dt);
+    }
+    startCharge(){ if(!this.canJump) return; this.holding=true; }
+    release(){
+        if(!this.holding || !this.canJump) { this.holding=false; this.charge=0; return; }
+        this.holding=false;
+        const power = 260 + this.charge * 720; // horizontal-ish
+        const angle = -Math.PI/2 + rand(-0.25, 0.25); // slight variation
+        this.vx = Math.cos(angle) * power;
+        this.vy = Math.sin(angle) * power - 120 * this.charge; // more vertical with charge
+        this.canJump=false;
+        this.charge=0;
+        spawnParticles(this.x, this.y, 8, 'jump');
+    }
+    draw(){
+        // shadow
+        ctx.save();
+        const sh = Math.min(1, Math.max(0.2, 1 - (this.y - (H*0.5))/H));
+        ctx.globalAlpha = 0.12 * sh;
+        ctx.beginPath(); ctx.ellipse(this.x, this.y + this.radius*0.8, this.radius*1.1, this.radius*0.5, 0, 0, TAU); ctx.fillStyle='#000'; ctx.fill();
+        ctx.restore();
+        // frog body
+        ctx.save();
+        ctx.translate(this.x,this.y);
+        if(this.inv>0) ctx.globalAlpha = 0.5 + 0.5*Math.sin(this.inv*50);
+        // body
+        ctx.fillStyle = '#25d37b';
+        roundRect(ctx, -this.radius, -this.radius, this.radius*2, this.radius*1.4, 10);
+        ctx.fill();
+        // eyes
+        ctx.fillStyle='#fff'; ctx.beginPath(); ctx.ellipse(-7,-12,6,7,0,0,TAU); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(7,-12,6,7,0,0,TAU); ctx.fill();
+        ctx.fillStyle='#000'; ctx.beginPath(); ctx.ellipse(-6,-10,2.5,3,0,0,TAU); ctx.fill();
+        ctx.beginPath(); ctx.ellipse(8,-10,2.5,3,0,0,TAU); ctx.fill();
+        ctx.restore();
+    }
+}
+
+// Pads, obstacles, particles
+function spawnPadsForLevel(level){
+    state.pads = [];
+    const count = 6 + Math.min(8, level+1);
+    let spacing = Math.max(140, H/count);
+    let baseY = H - 120;
+    for(let i=0;i<count;i++){
+        let w = rand(70, 180);
+        let x = rand(80, W-80);
+        let y = baseY - i*spacing + rand(-40,40);
+        const moveChance = Math.random() < Math.min(0.35, 0.08 + level*0.04);
+        const pad = {
+            x, y, w, h: 18,
+            move: moveChance,
+            vx: moveChance ? rand(-60-10*level, 60+10*level) : 0
+        };
+        state.pads.push(pad);
+    }
+    // add safe ground pad at bottom center
+    state.pads.push({x:W/2,y:H-50,w: W*0.8, h: 20, move:false});
+}
+
+function spawnObstacles(level){
+    state.obstacles = [];
+    // moving logs (dangerous), predators that jump
+    for(let i=0;i<Math.min(6, 2+Math.floor(level*1.2)); i++){
+        let y = rand(100, H-200);
+        let obs = {
+            x: rand(-200, W+200),
+            y,
+            w: rand(60,180), h:20,
+            vx: rand(level*20+40, level*20+160) * (Math.random()<0.5?1:-1),
+            type: Math.random()<0.5? 'log' : 'pred'
+        };
+        state.obstacles.push(obs);
+    }
+}
+
+// Particles
+function spawnParticles(x,y,n,type='puff'){
+    for(let i=0;i<n;i++){
+        state.particles.push({
+            x,y,
+            vx: rand(-120,120),
+            vy: rand(-200, -40),
+            life: rand(0.4,1.2),
+            size: rand(2,6),
+            col: type==='jump' ? '#ffd166' : '#89e1ff'
+        });
+    }
+}
+
+// Helpers
+function roundRect(ctx,x,y,w,h,r){ ctx.beginPath(); ctx.moveTo(x+r,y); ctx.arcTo(x+w,y,x+w,y+h,r); ctx.arcTo(x+w,y+h,x,y+h,r); ctx.arcTo(x,y+h,x,y,r); ctx.arcTo(x,y,x+w,y,r); ctx.closePath(); }
+
+// Game flow
+function startNew(level=1){
+    state.level = level;
+    state.score = 0;
+    state.lives = 3;
+    state.pads = [];
+    spawnPadsForLevel(level);
+    spawnObstacles(level);
+    state.player = new Frog(W/2, H-120);
+    state.spawnTimer = 0;
+    state.particles = [];
+    state.paused=false;
+    updateUI();
+    hideMessage();
+}
+
+function nextLevel(){
+    state.level++;
+    spawnPadsForLevel(state.level);
+    spawnObstacles(state.level);
+    state.player.x = W/2; state.player.y = H/2; state.player.vx = state.player.vy = 0;
+    state.player.inv = 0.8;
+    displayMessage('Level '+state.level, 1200);
+}
+
+function loseLife(){
+    state.lives--;
+    spawnParticles(state.player.x, H-60, 14, 'puff');
+    if(state.lives <= 0){
+        gameOver();
+    } else {
+        // respawn on safe pad
+        const safe = state.pads[state.pads.length-1];
+        state.player.x = safe.x;
+        state.player.y = safe.y - 40;
+        state.player.vx = state.player.vy = 0;
+        state.player.inv = 1.2;
+    }
+    updateUI();
+}
+
+function gameOver(){
+    if(state.score > state.high){ state.high = state.score; localStorage.setItem('leapfrog_high', state.high); }
+    displayMessage('Game Over\nScore: '+state.score+'\nHigh: '+state.high, 0, [
+        {t:'Restart',fn:()=>startNew(1)}
+    ]);
+    state.paused = true;
+}
+
+// UI
+const scoreEl=document.getElementById('score'), livesEl=document.getElementById('lives'), levelEl=document.getElementById('level');
+function updateUI(){ scoreEl.textContent = state.score; livesEl.textContent = state.lives; levelEl.textContent = state.level; }
+function displayMessage(text, duration=0, actions=null){
+    const el=document.getElementById('message');
+    el.style.display='block';
+    el.innerHTML = text.replace(/\n/g,'<br>');
+    if(actions){
+        el.innerHTML += '<div style="margin-top:12px"></div>';
+        for(let a of actions){
+            const b = document.createElement('button');
+            b.textContent = a.t; b.className = 'btn';
+            b.onclick = ()=>{ a.fn(); el.style.display='none'; };
+            el.appendChild(b);
+        }
+    }
+    if(duration>0) setTimeout(()=>el.style.display='none', duration);
+}
+function hideMessage(){ document.getElementById('message').style.display='none'; }
+
+// Input
+let keys = {};
+addEventListener('keydown', (e)=>{
+    if(e.key === ' ' || e.key === 'ArrowUp') { e.preventDefault(); keys.jump=true; playerStartCharge(); }
+    if(e.key === 'p') togglePause();
+    if(e.key === 'r') startNew(1);
+    if(e.key === 'ArrowLeft') keys.left=true;
+    if(e.key === 'ArrowRight') keys.right=true;
+});
+addEventListener('keyup', (e)=>{
+    if(e.key === ' ' || e.key === 'ArrowUp') { keys.jump=false; playerRelease(); }
+    if(e.key === 'ArrowLeft') keys.left=false;
+    if(e.key === 'ArrowRight') keys.right=false;
+});
+canvas.addEventListener('mousedown', (e)=>{ playerStartCharge(); });
+canvas.addEventListener('mouseup', (e)=>{ playerRelease(); });
+canvas.addEventListener('touchstart',(e)=>{ e.preventDefault(); showTouch(); playerStartCharge(); }, {passive:false});
+canvas.addEventListener('touchend',(e)=>{ e.preventDefault(); playerRelease(); }, {passive:false});
+
+function playerStartCharge(){ if(!state.player) return; if(state.paused) return; state.player.startCharge(); }
+function playerRelease(){ if(!state.player) return; state.player.release(); }
+
+// Buttons
+document.getElementById('pause').onclick = togglePause;
+document.getElementById('restart').onclick = ()=>startNew(1);
+document.getElementById('credits').onclick = (e)=>{ e.preventDefault(); displayMessage('LeapFrog\nHold jump to charge a stronger leap. Land on lily pads and avoid logs and predators. Built-in high score saved locally.'); };
+
+function togglePause(){
+    state.paused = !state.paused;
+    document.getElementById('pause').textContent = state.paused ? 'Resume' : 'Pause';
+    if(!state.paused) loop(performance.now());
+}
+
+// Touch UI
+function showTouch(){ if(innerWidth < 900) document.getElementById('touchControls').style.display='flex'; }
+
+// Main loop
+function loop(t){
+    if(state.paused) return;
+    const dt = Math.min(0.033, (t - last) / 1000 || 0.016);
+    last = t;
+    update(dt);
+    render();
+    requestAnimationFrame(loop);
+}
+
+// Update world
+function update(dt){
+    // player directional nudge
+    if(keys.left) state.player.x -= 180*dt;
+    if(keys.right) state.player.x += 180*dt;
+
+    state.player.update(dt);
+
+    // obstacles
+    for(let o of state.obstacles){
+        o.x += o.vx * dt;
+        if(o.x < -400 || o.x > W+400) o.vx *= -1;
+        // predator logic: occasionally leap
+        if(o.type==='pred' && Math.random() < 0.01 + state.level*0.005){
+            // if near player horizontally, launch
+            if(Math.abs(o.x - state.player.x) < 300){
+                spawnParticles(o.x, o.y, 6, 'jump');
+                // create a temporary jump towards player as hazardous entity
+                o.throw = { x:o.x, y:o.y, vx:(state.player.x - o.x)*1.1, vy:-300, life:1.2 };
+            }
+        }
+        if(o.throw){
+            o.throw.x += o.throw.vx*dt;
+            o.throw.y += o.throw.vy*dt;
+            o.throw.vy += 1000*dt;
+            o.throw.life -= dt;
+            // collision with player
+            if(dist(o.throw.x, o.throw.y, state.player.x, state.player.y) < 30 && state.player.inv<=0){
+                state.player.inv = 1.2; loseLife();
+            }
+            if(o.throw.life <= 0) o.throw = null;
+        }
+        // check collision with player: logs hurt
+        if(o.type==='log' && Math.abs(o.x - state.player.x) < (o.w/2 + state.player.radius - 2) && Math.abs(o.y - state.player.y) < 32 && state.player.inv <= 0){
+            state.player.inv = 1.2;
+            loseLife();
+        }
+    }
+
+    // pads move
+    for(let p of state.pads){
+        if(p.move){
+            p.x += p.vx * dt;
+            if(p.x < -p.w) p.x = W + p.w;
+            if(p.x > W + p.w) p.x = -p.w;
+        }
+    }
+
+    // particles
+    for(let i=state.particles.length-1;i>=0;i--){
+        const p=state.particles[i];
+        p.life -= dt;
+        p.x += p.vx*dt;
+        p.y += p.vy*dt;
+        p.vx *= 0.98;
+        p.vy += 300*dt;
+        if(p.life<=0) state.particles.splice(i,1);
+    }
+
+    // scoring: if landed on a pad that wasn't previously stood on
+    if(state.player.onPad && !state.player.onPad.visited){
+        state.player.onPad.visited = true;
+        state.score += 20 + Math.floor(state.player.charge*50);
+        spawnParticles(state.player.x, state.player.y, 12, 'puff');
+        if(state.score >= 200 + state.level*200){ nextLevel(); }
+        updateUI();
+    }
+
+    // occasional spawn of collectibles
+    state.spawnTimer -= dt;
+    if(state.spawnTimer <= 0){
+        state.spawnTimer = rand(3,6);
+        // spawn a collectible near top or on pad
+        const p = { x: rand(60, W-60), y: rand(80, H-240), t: 'fly', life: rand(8,14) };
+        state.obstacles.push(p);
+    }
+    // update collectibles life and collision
+    for(let i=state.obstacles.length-1;i>=0;i--){
+        const o = state.obstacles[i];
+        if(o.t === 'fly'){
+            o.life -= dt;
+            if(o.life <= 0) state.obstacles.splice(i,1);
+            if(dist(o.x,o.y,state.player.x,state.player.y) < 36){
+                state.score += 50;
+                spawnParticles(o.x,o.y,10,'jump');
+                state.obstacles.splice(i,1);
+                updateUI();
+            }
+        }
+    }
+}
+
+// Rendering
+function render(){
+    ctx.clearRect(0,0,W,H);
+    // sky gradient
+    const g = ctx.createLinearGradient(0,0,0,H);
+    g.addColorStop(0,'#081018'); g.addColorStop(1,'#0b2b3b');
+    ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+    // parallax hills
+    for(let i=0;i<3;i++){
+        ctx.globalAlpha = 0.14*(i+1);
+        ctx.fillStyle = `hsl(${200+(i*10)},60%,${10+i*6}%)`;
+        ctx.beginPath();
+        const amp = 60 + i*30;
+        ctx.moveTo(0,H*0.6 + i*40);
+        for(let x=0;x<=W;x+=20){
+            ctx.lineTo(x, H*0.6 + i*40 + Math.sin((x*0.004)+(i*0.4))*amp);
+        }
+        ctx.lineTo(W,H); ctx.lineTo(0,H); ctx.closePath(); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // water region (lower portion)
+    ctx.fillStyle = 'rgba(10,108,168,0.14)';
+    ctx.fillRect(0,H-150,W,150);
+    // lily pads
+    for(let p of state.pads){
+        ctx.save();
+        // pad shadow
+        ctx.globalAlpha = 0.25;
+        ctx.beginPath(); ctx.ellipse(p.x, p.y+6, p.w*0.7, 10, 0, 0, TAU); ctx.fillStyle='#000'; ctx.fill();
+        ctx.globalAlpha = 1;
+        // pad body
+        ctx.fillStyle = '#1f8b5d';
+        roundRect(ctx, p.x - p.w/2, p.y - p.h/2, p.w, p.h, 12);
+        ctx.fill();
+        // detail
+        ctx.fillStyle = 'rgba(255,255,255,0.04)';
+        roundRect(ctx, p.x - p.w/2 + 6, p.y - p.h/2 + 4, p.w-12, p.h-8, 8); ctx.fill();
+        ctx.restore();
+    }
+
+    // obstacles (logs/predators/flies)
+    for(let o of state.obstacles){
+        if(o.t === 'fly'){
+            ctx.save();
+            ctx.translate(o.x,o.y);
+            ctx.fillStyle = '#fff3';
+            ctx.beginPath(); ctx.ellipse(0,0,8,6,0,0,TAU); ctx.fill();
+            ctx.fillStyle='#ffdd66';
+            ctx.beginPath(); ctx.ellipse(0,0,5,4,0,0,TAU); ctx.fill();
+            ctx.restore();
+            continue;
+        }
+        ctx.save();
+        ctx.translate(o.x,o.y);
+        if(o.type === 'log'){
+            ctx.fillStyle = '#6b3a19';
+            roundRect(ctx, -o.w/2, -o.h/2, o.w, o.h, 8);
+            ctx.fill();
+            ctx.fillStyle='rgba(255,255,255,0.04)'; roundRect(ctx, -o.w/2+6, -o.h/2+3, o.w-12, o.h-6, 6); ctx.fill();
+        } else if(o.type === 'pred'){
+            // frog-like predator
+            ctx.fillStyle = '#e85d5d';
+            roundRect(ctx, -24, -18, 48, 32, 10); ctx.fill();
+            ctx.fillStyle='#fff'; ctx.beginPath(); ctx.ellipse(-10,-10,6,6,0,0,TAU); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(10,-10,6,6,0,0,TAU); ctx.fill();
+        }
+        // thrown object
+        if(o.throw){
+            ctx.fillStyle = '#ffdd99';
+            ctx.beginPath(); ctx.ellipse(o.throw.x, o.throw.y, 10,8,0,0,TAU); ctx.fill();
+        }
+        ctx.restore();
+    }
+
+    // particles
+    for(let p of state.particles){
+        ctx.fillStyle = p.col;
+        ctx.globalAlpha = clamp(p.life,0,1);
+        ctx.beginPath(); ctx.ellipse(p.x,p.y,p.size,p.size*0.7,0,0,TAU); ctx.fill();
+        ctx.globalAlpha = 1;
+    }
+
+    // player
+    if(state.player) state.player.draw();
+
+    // UI overlays: charge bar
+    if(state.player && state.player.holding){
+        const w = 160, h = 12;
+        const x = state.player.x - w/2, y = state.player.y - state.player.radius - 26;
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        roundRect(ctx, x-4, y-6, w+8, h+12, 8); ctx.fill();
+        ctx.fillStyle = '#222'; roundRect(ctx, x, y, w, h, 6); ctx.fill();
+        ctx.fillStyle = '#ffd166';
+        roundRect(ctx, x, y, w * (state.player.charge/state.player.maxCharge), h, 6); ctx.fill();
+    }
+
+    // corner info
+    ctx.fillStyle='rgba(255,255,255,0.06)';
+    ctx.fillRect(12,H-38,220,28);
+    ctx.fillStyle='#fff'; ctx.font='12px Inter,Arial'; ctx.fillText('High: '+state.high, 20, H-18);
+}
+
+// helpers
+function dist(x1,y1,x2,y2){ return Math.hypot(x1-x2,y1-y2); }
+
+// init + start
+startNew(1);
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
